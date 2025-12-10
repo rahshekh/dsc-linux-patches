@@ -1,0 +1,285 @@
+From 7ad8f214f6f5ebac4592151e8226d830cec420bc Mon Sep 17 00:00:00 2001
+From: rahshekh <rahulshekhar@pensando.io>
+Date: Tue, 9 Dec 2025 23:27:38 -0800
+Subject: [PATCH] Clean up sbus and penfw drv/smc.
+
+Signed-off-by: rahshekh <rahulshekhar@pensando.io>
+---
+ drivers/soc/pensando/penfw.h     |  3 +-
+ drivers/soc/pensando/penfw_drv.c | 46 ++--------------------------
+ drivers/soc/pensando/penfw_smc.c | 16 +++-------
+ drivers/soc/pensando/sbus.c      | 51 +++++++++++++-------------------
+ 4 files changed, 28 insertions(+), 88 deletions(-)
+
+diff --git a/drivers/soc/pensando/penfw.h b/drivers/soc/pensando/penfw.h
+index a142651b10cb..22c7c71c77f2 100644
+--- a/drivers/soc/pensando/penfw.h
++++ b/drivers/soc/pensando/penfw.h
+@@ -85,8 +85,7 @@ typedef struct penfw_svc_args_s {
+ #define PENFW_FWCALL     _IOWR(PENFW_IOCTL_NUM, 1, struct penfw_call_args)
+ #define PENFW_SVC        _IOWR(PENFW_IOCTL_NUM, 2, penfw_svc_args_t)
+ 
+-int is_user_address_valid(pid_t pid, unsigned long addr);
+ void penfw_smc(struct penfw_call_args *args);
+-long penfw_svc_smc(struct device *penfw_dev, pid_t pid, penfw_svc_args_t *args);
++long penfw_svc_smc(penfw_svc_args_t *args);
+ 
+ #endif /* __PENFW_H__ */
+diff --git a/drivers/soc/pensando/penfw_drv.c b/drivers/soc/pensando/penfw_drv.c
+index 1fa5f6acd9d2..40190b0ef8f3 100644
+--- a/drivers/soc/pensando/penfw_drv.c
++++ b/drivers/soc/pensando/penfw_drv.c
+@@ -10,9 +10,7 @@
+ #include <linux/fs.h>
+ #include <linux/uaccess.h>
+ #include <linux/types.h>
+-#include <linux/mm.h>
+ #include <linux/mutex.h>
+-#include <linux/sched/mm.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <linux/arm-smccc.h>
+@@ -25,7 +23,7 @@
+ 
+ static int    majorNumber;
+ static struct class *penfw_class;
+-static struct device *penfw_dev;
++struct device *penfw_dev;
+ static DEFINE_MUTEX(penfw_mutex);
+ 
+ void *penfwdata;
+@@ -36,52 +34,12 @@ static int penfw_open(struct inode *inodep, struct file *filep)
+ 	return 0;
+ }
+ 
+-// Checks if the address is mapped to the process's address space
+-int is_user_address_valid(pid_t pid, unsigned long addr)
+-{
+-	struct task_struct *task;
+-	struct mm_struct *mm;
+-	struct vm_area_struct *vma;
+-	int ret = -1;
+-
+-	task = pid_task(find_vpid(pid), PIDTYPE_PID);
+-	if (!task) {
+-	    pr_err("smc_drv : unable to find task for pid %u", (uint32_t)pid);
+-	    return -ESRCH;
+-	}
+-	mm = get_task_mm(task);
+-	if (!mm) {
+-	    pr_err("smc_drv : unable to get mm for task with pid %u", (uint32_t)pid);
+-	    return -ESRCH;
+-	}
+-
+-	down_read(&mm->mmap_lock);
+-	vma = find_vma(mm, addr);
+-	// The address is valid and mapped in this VMA
+-	if (vma)
+-	    ret = 0;
+-	up_read(&mm->mmap_lock);
+-	mmput(mm);
+-
+-	return ret;
+-}
+-
+ static long penfw_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+ 	long ret = 0;
+ 	void __user *argp = (void __user *)arg;
+ 	struct penfw_call_args penfw_args_ob;
+ 	penfw_svc_args_t penfw_svc_args;
+-	pid_t pid;
+-
+-
+-	pid = task_pid_nr(current);
+-	if (is_user_address_valid(pid, (unsigned long)argp) != 0) {
+-		dev_err(penfw_dev, "user address %lx is not mapped to pid %u\n",
+-			(unsigned long)argp, pid);
+-		ret = -EFAULT;
+-		goto err;
+-	}
+ 
+ 	switch (cmd) {
+ 	case PENFW_FWCALL:
+@@ -108,7 +66,7 @@ static long penfw_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			ret = -EFAULT;
+ 			goto err;
+ 		}
+-		ret = penfw_svc_smc(penfw_dev, pid, &penfw_svc_args);
++		ret = penfw_svc_smc(&penfw_svc_args);
+ 		if (ret != 0) {
+ 			dev_err(penfw_dev, "error in smc handling %ld\n",
+ 				ret);
+diff --git a/drivers/soc/pensando/penfw_smc.c b/drivers/soc/pensando/penfw_smc.c
+index 331579627e0c..d52b69d199e3 100644
+--- a/drivers/soc/pensando/penfw_smc.c
++++ b/drivers/soc/pensando/penfw_smc.c
+@@ -15,6 +15,7 @@
+ #define PENFW_CALL_FID			    0xC2000002
+ 
+ extern void *penfwdata;
++extern struct device *penfw_dev;
+ extern phys_addr_t penfwdata_phys;
+ void penfw_smc_get_chip_cert(struct penfw_call_args *args);
+ void penfw_smc_attest_get_time(struct penfw_call_args *args);
+@@ -181,7 +182,6 @@ void penfw_smc_attest_get_time(struct penfw_call_args *args)
+  */
+ void penfw_smc_get_secure_intrs(struct penfw_call_args *args)
+ {
+-	uint32_t i;
+ 	uint32_t len = 0;
+ 	struct arm_smccc_res res = {0};
+ 	struct penfw_secure_intrs u_intrs;
+@@ -234,7 +234,7 @@ void penfw_smc(struct penfw_call_args *args)
+ {
+ 	struct arm_smccc_res res = {0};
+ 
+-	pr_debug("penfw: smc call for fn: %s\n",
++	dev_dbg(penfw_dev, "penfw: smc call for fn: %s\n",
+ 		 _opcode_to_str(args->a1));
+ 
+ 	switch (args->a1) {
+@@ -278,12 +278,12 @@ void penfw_smc(struct penfw_call_args *args)
+ 		break;
+ 	}
+ 
+-	pr_debug("penfw: smc return a0: 0x%llx a1: 0x%llx "\
++	dev_dbg(penfw_dev, "penfw: smc return a0: 0x%llx a1: 0x%llx "\
+ 		 "a2: 0x%llx a3: 0x%llx\n", args->a0, args->a1,
+ 		 args->a2, args->a3);
+ }
+ 
+-long penfw_svc_smc(struct device *penfw_dev, pid_t pid, penfw_svc_args_t *args)
++long penfw_svc_smc(penfw_svc_args_t *args)
+ {
+ 	struct arm_smccc_res res = { 0 };
+ 	void *cfg = NULL;
+@@ -293,14 +293,6 @@ long penfw_svc_smc(struct device *penfw_dev, pid_t pid, penfw_svc_args_t *args)
+ 	long ret = 0;
+ 
+ 	if (args->length_in != 0) {
+-		if (is_user_address_valid(pid, args->value) != 0) {
+-			dev_err(penfw_dev, "User address %llx for smc cmd"
+-				"(%llx/%llx) is not mapped to process with pid %u\n",
+-				args->value, args->func_id,
+-				args->sub_func_id, pid);
+-			ret = -EFAULT;
+-			goto err;
+-		}
+ 		cfg = (void *)__get_free_pages((GFP_KERNEL | GFP_ATOMIC | __GFP_ZERO),
+ 						get_order(args->length_in));
+ 		if (cfg == NULL) {
+diff --git a/drivers/soc/pensando/sbus.c b/drivers/soc/pensando/sbus.c
+index 9cebe1fceb6f..35f5adc3520c 100644
+--- a/drivers/soc/pensando/sbus.c
++++ b/drivers/soc/pensando/sbus.c
+@@ -54,14 +54,14 @@ struct sbus_ioctl_args {
+ };
+ 
+ struct sbus_reg_ops {
+-	void (*write)(void *addr, uint32_t val);
+-	uint32_t (*read)(void *addr);
++	void (*write)(void __iomem *addr, uint32_t val);
++	uint32_t (*read)(void __iomem *addr);
+ };
+ 
+ struct sbusdev_info {
+ 	struct platform_device *pdev;
+-	void *sbus_indir;
+-	void *sbus_dhs;
++	void __iomem *sbus_indir;
++	void __iomem *sbus_dhs;
+ 	spinlock_t sbus_lock;
+ 	struct cdev cdev;
+ 	struct sbus_reg_ops *rops;
+@@ -81,47 +81,36 @@ static int sbus_drv_open(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
+-static void reg_write(void *a, uint32_t val)
++static void reg_write(void __iomem *addr, uint32_t val)
+ {
+-	void __iomem *addr = (void __iomem *)a;
+ 	iowrite32(val, addr);
+ }
+ 
+-static uint32_t reg_read(void *a)
++static uint32_t reg_read(void __iomem *addr)
+ {
+-	void __iomem *addr = (void __iomem *)a;
+ 	return ioread32(addr);
+ }
+ 
+-static void reg_smc_write(void *addr, uint32_t val)
++static void reg_smc_write(void __iomem *addr, uint32_t val)
+ {
+ 	struct arm_smccc_res res = {0};
+-	struct pt_regs args = {0};
+ 
+-	args.regs[0] = PEN_SBUS_SMC_CALL_FID;
+-	args.regs[1] = PEN_SBUS_SMC_REG_WRITE;
+-	args.regs[2] = (uint64_t)addr;
+-	args.regs[3] = val;
+-
+-	arm_smccc_smc(args.regs[0], args.regs[1], args.regs[2], args.regs[3], 0, 0,
+-				  0, 0, &res);
++	arm_smccc_smc(PEN_SBUS_SMC_CALL_FID,
++		      PEN_SBUS_SMC_REG_WRITE, (uint64_t)addr,
++		      val, 0, 0, 0, 0, &res);
+ 
+ 	if (res.a0 != PEN_SBUS_SMC_ERR_NONE) {
+ 		pr_err("pensando-sbus: failed to write data! ret=%d\n", (int)res.a0);
+ 	}
+ }
+ 
+-static uint32_t reg_smc_read(void *addr)
++static uint32_t reg_smc_read(void __iomem *addr)
+ {
+ 	struct arm_smccc_res res = {0};
+-	struct pt_regs args = {0};
+-
+-	args.regs[0] = PEN_SBUS_SMC_CALL_FID;
+-	args.regs[1] = PEN_SBUS_SMC_REG_READ;
+-	args.regs[2] = (uint64_t)addr;
+ 
+-	arm_smccc_smc(args.regs[0], args.regs[1], args.regs[2], 0, 0, 0,
+-				  0, 0, &res);
++	arm_smccc_smc(PEN_SBUS_SMC_CALL_FID,
++		      PEN_SBUS_SMC_REG_READ, (uint64_t)addr,
++		      0, 0, 0, 0, 0, &res);
+ 
+ 	if (res.a0 != PEN_SBUS_SMC_ERR_NONE) {
+ 		pr_err("pensando-sbus: read failed! ret=%ld\n", res.a0);
+@@ -292,6 +281,7 @@ static int sbus_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct resource *res;
+ 	struct sbusdev_info *sbus_ring;
++	void __iomem *sbus_indir;
+ 	int is_secure = 0;
+ 
+ 	if (dev_inst > MAX_DEVICES-1)
+@@ -313,15 +303,16 @@ static int sbus_probe(struct platform_device *pdev)
+ 	is_secure = of_get_secure_mode();
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (is_secure) {
+-		sbus_ring->sbus_indir = (void *)res->start;
++		sbus_indir = (void __iomem *)res->start;
+ 	} else {
+-		sbus_ring->sbus_indir = (void *)devm_ioremap_resource(dev, res);
+-		if (IS_ERR(sbus_ring->sbus_indir)) {
++		sbus_indir = (void __iomem *)devm_ioremap_resource(dev, res);
++		if (IS_ERR(sbus_indir)) {
+ 			dev_err(dev, "Cannot remap sbus reg addresses.\n");
+-			return PTR_ERR(sbus_ring->sbus_indir);
++			return PTR_ERR(sbus_indir);
+ 		}
+ 	}
+-	sbus_ring->sbus_dhs = sbus_ring->sbus_indir + 0x4;
++	sbus_ring->sbus_indir = sbus_indir;
++	sbus_ring->sbus_dhs = (void __iomem *)(sbus_ring->sbus_indir + 0x4);
+ 
+ 	spin_lock_init(&sbus_ring->sbus_lock);
+ 
+-- 
+2.25.1
+
